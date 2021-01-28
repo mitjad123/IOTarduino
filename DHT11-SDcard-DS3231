@@ -1,0 +1,230 @@
+// Example testing sketch for various DHT humidity/temperature sensors Written by ladyada, public domain
+
+//from other examples:
+//SD card https://create.arduino.cc/projecthub/electropeak/sd-card-module-with-arduino-how-to-read-write-data-37f390
+//https://www.youtube.com/watch?v=-dW4XsBo3Mk
+
+//frizing: https://www.dropbox.com/s/5yowvr9a5iqoxns/Schematic_arduino%20pro%20mini%20ds3231%20dht11_2021-01-27.pdf?dl=0
+
+//Vcc-s:
+//DHT11 3.5-5.5V
+//DS3231 2.3-5.5V
+//SDcard 4.5-5.5V
+
+//for SD card module
+#include <SD.h>
+File myFile;
+String cs;
+
+// for sleep and wakeup operations
+#include <Wire.h>
+#include <avr/sleep.h>//this AVR library contains the methods that controls the sleep modes
+// the pin that is connected to SQW
+#define wakePin 2 //ta mora bit 2 ali 3 ker so samo tam interupti
+int stoploop = false;
+
+//for time mamagenet with ds3231
+#include <ds3231.h>
+// DS3231 alarm time
+uint8_t wake_HOUR;
+uint8_t wake_MINUTE;
+uint8_t wake_SECOND;
+#define BUFF_MAX 32
+char buff[BUFF_MAX];
+// A struct is a structure of logical variables used as a complete unit
+struct ts tts;
+
+//for DHT11 sensor
+#include "DHT.h"
+#define DHTPIN 5     // Digital pin connected to the DHT sensor
+// Uncomment whatever type you're using!
+#define DHTTYPE DHT11   // DHT 11
+//#define DHTTYPE DHT22   // DHT 22  (AM2302), AM2321
+//#define DHTTYPE DHT21   // DHT 21 (AM2301)
+// Initialize DHT sensor.
+DHT dht(DHTPIN, DHTTYPE);
+
+
+void setup() {
+  Serial.begin(9600);
+
+  //Initializing SD card...
+  if (!SD.begin(10)) {
+    Serial.println("SDini failed");
+  }
+  Serial.println("SDini done");
+
+  dht.begin();
+  //Set date/time if not already set
+  /*
+  DS3231_get(&tts);
+  tts.sec = 0;
+  tts.min = 05;
+  tts.hour = 20;
+  tts.mday = 27;
+  tts.mon = 1;
+  tts.year = 2021;
+  DS3231_set(tts);
+  */
+
+  temp_Humi();//function that reads the temp and the humidity and writes to the SD card
+
+  // Making it so, that the alarm will trigger an interrupt
+  pinMode(wakePin, INPUT_PULLUP);
+  // Clear the current alarm (puts DS3231 INT high)
+  Wire.begin();
+  DS3231_init(DS3231_CONTROL_INTCN); //get ready
+  DS3231_clear_a1f(); //clear existing alarms
+
+  Serial.println(" .... Setup completed.");
+}
+
+void loop() {
+
+  // Set the DS3231 alarm to wake up in X seconds
+  setNextAlarm();
+  // Disable the ADC (Analog to digital converter, pins A0 [14] to A5 [19])
+  static byte prevADCSRA = ADCSRA;
+  ADCSRA = 0;
+  
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  sleep_enable();
+
+  // BODS must be set to one and BODSE must be set to zero within four clock cycles. This sets
+  // the MCU Control Register (MCUCR)
+  MCUCR = bit (BODS) | bit(BODSE);
+
+  // The BODS bit is automatically cleared after three clock cycles so we better get on with it
+  MCUCR = bit(BODS);
+  // Ensure we can wake up again by first disabling interupts (temporarily) so
+  // the wakeISR does not run before we are asleep and then prevent interrupts,
+  // and then defining the ISR (Interrupt Service Routine) to run when poked awake
+  noInterrupts();
+  attachInterrupt(digitalPinToInterrupt(wakePin), sleepISR, LOW);
+
+  // Send a message just to show we are about to sleep
+  Serial.println(" Good night! ");
+  Serial.flush();
+
+  // Allow interrupts now
+  interrupts();
+
+  // And enter sleep mode as set above
+  sleep_cpu();
+
+  // --------------------------------------------------------
+  // µController is now asleep until woken up by an interrupt
+  // --------------------------------------------------------
+
+  // Wakes up at this point when wakePin is brought LOW - interrupt routine is run first
+  Serial.println("I'm awake!");
+
+  // Clear existing alarm so int pin goes high again
+  DS3231_clear_a1f();
+  // Re-enable ADC if it was previously running
+  ADCSRA = prevADCSRA;
+
+  //when awake do the measurement and write to the SD card
+  temp_Humi();//function that reads the temp and the humidity and writes to the SD card
+
+}
+
+//This function reads the temperature and humidity from the DHT sensor
+void temp_Humi(){
+  // Reading temperature or humidity takes about 250 milliseconds!
+  // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
+
+  // Reading temperature or humidity takes about 250 milliseconds!
+  // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
+  float h = dht.readHumidity();
+  // Read temperature as Celsius (the default)
+  float t = dht.readTemperature();
+  // Read temperature as Fahrenheit (isFahrenheit = true)
+  float f = dht.readTemperature(true);
+
+  // Check if any reads failed and exit early (to try again).
+  if (isnan(h) || isnan(t) || isnan(f)) {
+    Serial.println(F("Failed to read from DHT sensor!"));
+    return;
+  }
+  writeData(h,t,f);//sends the data to the writeData function
+  
+  //a loop that waits for SD writting to be done, I think?
+  while ( !stoploop)
+    {
+    }
+  stoploop = false;
+
+}
+
+
+void writeData(float h,float t,float f){
+  // Get the time
+  DS3231_get(&tts);
+  // display current time
+  snprintf(buff, BUFF_MAX, "%d.%02d.%02d %02d:%02d:%02d\n", tts.year, tts.mon, tts.mday, tts.hour, tts.min, tts.sec);
+
+  myFile = SD.open("text.txt", FILE_WRITE);// creates the file object for writing
+
+  // if the file opened okay, write to it:
+  if (myFile) {
+    Serial.print("Writing to text.txt: ");
+    //appends a line to the file with time stamp and humidity and temperature data
+    Serial.println(String(buff)+" Hum: "+String(h)+"% C: "+String(t)+" F: "+String(f));
+    myFile.println(String(buff)+" Hum: "+String(h)+"% C: "+String(t)+" F: "+String(f));
+
+    // close the file:
+    myFile.close();
+    Serial.println(".done.");
+  } else {
+    // if the file didn't open, print an error:
+    Serial.println("error opening text.txt");
+  } 
+  stoploop = true;
+}
+
+// When wakePin is brought LOW this interrupt is triggered FIRST (even in PWR_DOWN sleep)
+void sleepISR() {
+  // Prevent sleep mode, so we don't enter it again, except deliberately, by code
+  sleep_disable();
+
+  // Detach the interrupt that brought us out of sleep
+  detachInterrupt(digitalPinToInterrupt(wakePin));
+
+  // Now we continue running the main Loop() just after we went to sleep
+}
+
+
+// Set the next alarm
+void setNextAlarm(void)
+    {
+  // flags define what calendar component to be checked against the current time in order
+  // to trigger the alarm - see datasheet
+  // A1M1 (seconds) (0 to enable, 1 to disable)
+  // A1M2 (minutes) (0 to enable, 1 to disable)
+  // A1M3 (hour)    (0 to enable, 1 to disable)
+  // A1M4 (day)     (0 to enable, 1 to disable)
+  // DY/DT          (dayofweek == 1/dayofmonth == 0)
+  uint8_t flags[5] = { 0, 0, 0, 1, 1 };
+
+  // get current time so we can calc the next alarm
+  DS3231_get(&tts);
+
+  wake_SECOND = tts.sec;
+  wake_MINUTE = tts.min;
+  wake_HOUR = tts.hour;
+
+  // Add a some seconds to current time. If overflow increment minutes, hours, days etc.
+  wake_MINUTE = wake_MINUTE + 15;
+  if (wake_MINUTE > 59)
+  {
+    wake_HOUR++;
+    wake_MINUTE -= 60;
+  }
+
+  // Set the alarm time (but not yet activated)
+  DS3231_set_a1(wake_SECOND, wake_MINUTE, wake_HOUR, 0, flags);
+
+  // Turn the alarm on
+  DS3231_set_creg(DS3231_CONTROL_INTCN | DS3231_CONTROL_A1IE);
+}
